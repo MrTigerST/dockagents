@@ -22,7 +22,7 @@ use crate::signing;
 #[derive(Debug, Parser)]
 #[command(
     name = "dockagents",
-    version,
+    version = crate::updater::CURRENT_VERSION,
     about = "DockAgents — distributable multi-agent sandboxes",
     propagate_version = true
 )]
@@ -33,6 +33,27 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Cmd {
+    /// Scaffold a new sandbox in the current directory. Local-only —
+    /// no registry account required. The generated sandbox is immediately
+    /// runnable with `dockagents run ./<name>`.
+    Init {
+        /// Sandbox name. A directory with this name is created in the
+        /// current working directory.
+        name: String,
+        /// Description for the manifest. Optional; you can edit later.
+        #[arg(long)]
+        description: Option<String>,
+        /// LLM provider for the generated agent. Defaults to `anthropic`.
+        #[arg(long, default_value = "anthropic")]
+        provider: String,
+        /// Model string passed to the provider. Defaults to a sensible model
+        /// for the chosen provider.
+        #[arg(long)]
+        model: Option<String>,
+        /// Overwrite an existing directory with the same name.
+        #[arg(long)]
+        force: bool,
+    },
     /// Install a sandbox by name or natural-language description.
     Install {
         /// Sandbox name, registry path, or natural language query (in quotes).
@@ -91,11 +112,21 @@ pub enum Cmd {
         #[arg(long, conflicts_with = "sign")]
         no_sign: bool,
     },
-    /// Generate a publisher Ed25519 keypair under `~/.dockagents/keys/`.
+    /// Internal: regenerate the local Ed25519 signing key. Hidden because
+    /// `dockagents login` already does this transparently the first time it
+    /// runs on a new machine. Pass `--force` to rotate.
+    #[command(hide = true)]
     Keygen {
         /// Overwrite an existing key.
         #[arg(long)]
         force: bool,
+    },
+    /// Internal: print the publisher key file content. Hidden — `dockagents
+    /// login` already attaches the key to your account automatically.
+    #[command(hide = true)]
+    Pubkey {
+        #[arg(long)]
+        quiet: bool,
     },
     /// Run the MCP server (JSON-RPC over stdio).
     Mcp,
@@ -143,21 +174,44 @@ pub enum Cmd {
         #[command(subcommand)]
         action: RegistryCmd,
     },
-    /// Save an auth token for `dockagents publish` (mint one at <website>/me).
+    /// Authenticate the CLI with dockagents.net. Opens a browser to approve
+    /// the link; on approval the website returns an API token and auto-claims
+    /// this machine's Ed25519 publisher key so the sandboxes you publish are
+    /// attributed to your account.
     Login {
-        /// The token shown on the website's account page (starts with `dgkp_`).
+        /// Headless override: paste a token minted at https://dockagents.net/me
+        /// instead of running the browser flow. Useful for CI.
         #[arg(long)]
-        token: String,
+        token: Option<String>,
         /// Registry alias or URL this token is for. Defaults to the current
         /// default registry.
         #[arg(long)]
         registry: Option<String>,
+        /// Override the website used for the browser flow. Defaults to
+        /// `DOCKAGENTS_WEBSITE_URL` env var, then `https://dockagents.net`.
+        #[arg(long)]
+        website: Option<String>,
+        /// Don't try to open a browser; just print the URL to visit.
+        #[arg(long)]
+        no_browser: bool,
     },
     /// Forget the saved auth token for a registry.
     Logout {
         /// Registry alias or URL to forget. Defaults to the current default registry.
         #[arg(long)]
         registry: Option<String>,
+    },
+    /// Check GitHub Releases for a DockAgents update and install it.
+    Update {
+        /// Only check whether an update is available; do not install it.
+        #[arg(long)]
+        check: bool,
+        /// Install without prompting.
+        #[arg(long)]
+        yes: bool,
+        /// GitHub repository to use, as owner/repo or a github.com URL.
+        #[arg(long)]
+        repo: Option<String>,
     },
     /// Internal: agent subprocess entry point. Reads its config from stdin.
     #[command(name = "__agent", hide = true)]
@@ -219,10 +273,26 @@ pub enum ConfigCmd {
     },
     /// Remove the configured default LLM.
     ClearDefaultLlm,
+    /// Configure GitHub update checks and optional automatic installs.
+    SetUpdates {
+        /// Enable or disable daily GitHub update checks.
+        #[arg(long, value_name = "BOOL")]
+        check: Option<bool>,
+        /// Enable or disable automatic installs when an update is found.
+        #[arg(long, value_name = "BOOL")]
+        auto_install: Option<bool>,
+        /// GitHub repository to check, as owner/repo or a github.com URL.
+        #[arg(long)]
+        github_repo: Option<String>,
+    },
 }
 
 pub fn dispatch(cli: Cli) -> Result<ExitCode> {
     paths::ensure_layout()?;
+
+    if should_check_for_updates(&cli.cmd) {
+        crate::updater::maybe_notify_or_auto_update();
+    }
 
     match cli.cmd {
         Cmd::Agent => match crate::agent::run() {
@@ -232,6 +302,14 @@ pub fn dispatch(cli: Cli) -> Result<ExitCode> {
                 Ok(ExitCode::from(1))
             }
         },
+        Cmd::Init {
+            name,
+            description,
+            provider,
+            model,
+            force,
+        } => cmd_init(&name, description.as_deref(), &provider, model.as_deref(), force)
+            .map(|_| ExitCode::from(0)),
         Cmd::Install {
             target,
             registry,
@@ -280,17 +358,238 @@ pub fn dispatch(cli: Cli) -> Result<ExitCode> {
         Cmd::Manifest { target } => cmd_manifest(&target).map(|_| ExitCode::from(0)),
         Cmd::Config { action } => cmd_config(action).map(|_| ExitCode::from(0)),
         Cmd::Registry { action } => cmd_registry(action).map(|_| ExitCode::from(0)),
-        Cmd::Login { token, registry } => {
-            cmd_login(&token, registry.as_deref()).map(|_| ExitCode::from(0))
-        }
+        Cmd::Login {
+            token,
+            registry,
+            website,
+            no_browser,
+        } => cmd_login(
+            token.as_deref(),
+            registry.as_deref(),
+            website.as_deref(),
+            no_browser,
+        )
+        .map(|_| ExitCode::from(0)),
         Cmd::Logout { registry } => cmd_logout(registry.as_deref()).map(|_| ExitCode::from(0)),
+        Cmd::Update { check, yes, repo } => {
+            cmd_update(check, yes, repo.as_deref()).map(|_| ExitCode::from(0))
+        }
         Cmd::Keygen { force } => cmd_keygen(force).map(|_| ExitCode::from(0)),
+        Cmd::Pubkey { quiet } => cmd_pubkey(quiet).map(|_| ExitCode::from(0)),
         Cmd::Mcp => crate::mcp::run().map(|_| ExitCode::from(0)),
         Cmd::Serve { port, host } => crate::api::serve(&host, port).map(|_| ExitCode::from(0)),
         Cmd::Watch { target, debounce } => {
             crate::watcher::watch(&target, &debounce).map(|_| ExitCode::from(0))
         }
     }
+}
+
+fn should_check_for_updates(cmd: &Cmd) -> bool {
+    !matches!(
+        cmd,
+        Cmd::Agent | Cmd::Mcp | Cmd::Update { .. } | Cmd::Config {
+            action: ConfigCmd::SetUpdates { .. }
+        }
+    )
+}
+
+/// Scaffold a new sandbox directory the user can run locally. The generated
+/// sandbox has a single agent (`reviewer`), so `dockagents run` works
+/// against any text or directory input without further edits. Users can
+/// extend or replace any of the generated files.
+fn cmd_init(
+    name: &str,
+    description: Option<&str>,
+    provider: &str,
+    model: Option<&str>,
+    force: bool,
+) -> Result<()> {
+    // Validate the name — has to be a usable directory name AND a valid
+    // sandbox name per the manifest schema.
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("sandbox name cannot be empty"));
+    }
+    if !trimmed
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(anyhow!(
+            "sandbox name must contain only letters, digits, hyphens, or underscores"
+        ));
+    }
+    if !trimmed.chars().next().unwrap().is_ascii_alphanumeric() {
+        return Err(anyhow!(
+            "sandbox name must start with a letter or digit"
+        ));
+    }
+
+    let provider_norm = match provider.to_ascii_lowercase().as_str() {
+        "anthropic" | "openai" | "openai-compatible" => provider.to_ascii_lowercase(),
+        other => {
+            return Err(anyhow!(
+                "unknown provider '{other}' — use anthropic, openai, or openai-compatible"
+            ))
+        }
+    };
+    let default_model: &str = match provider_norm.as_str() {
+        "anthropic" => "claude-sonnet-4-6",
+        "openai" => "gpt-4o-mini",
+        _ => "gpt-4o-mini",
+    };
+    let model_to_use = model.unwrap_or(default_model);
+    let api_key_env = match provider_norm.as_str() {
+        "anthropic" => "ANTHROPIC_API_KEY",
+        _ => "OPENAI_API_KEY",
+    };
+    let desc = description.unwrap_or("One-agent code reviewer. Reads input, writes a Markdown report.");
+
+    let root = std::path::PathBuf::from(trimmed);
+    if root.exists() {
+        if !force {
+            return Err(anyhow!(
+                "directory `{}` already exists. Pass --force to overwrite, or pick a different name.",
+                root.display()
+            ));
+        }
+        std::fs::remove_dir_all(&root)
+            .with_context(|| format!("removing existing {}", root.display()))?;
+    }
+    std::fs::create_dir_all(root.join("skills"))
+        .with_context(|| format!("creating {}", root.join("skills").display()))?;
+
+    let manifest = format!(
+        r#"name:        {name}
+version:     0.1.0
+description: {desc}
+
+# `persistent` keeps the agent process warm between runs (faster on the
+# second invocation). Switch to `ephemeral` to spin everything down between
+# runs at the cost of a slightly slower start.
+lifecycle: persistent
+
+execution:
+  mode:    sync       # sync = one input → one output; async = streaming
+  timeout: 180s
+  input:
+    - type: text
+    - type: directory
+      accepts: [py, ts, rs, go, js, java, md, txt]
+  output:
+    - type: text
+
+agents:
+  - id:        reviewer
+    model:     {model_to_use}
+    skill:     ./skills/reviewer.md
+    workspace: ./workspaces/reviewer/
+    llm:
+      provider:    {provider_norm}
+      api_key_env: {api_key_env}
+      max_tokens:  2048
+
+capabilities:
+  invoke:  []        # IDs of other sandboxes this one is allowed to call
+  network: false     # set true if the agent needs the internet at runtime
+"#,
+        name = trimmed,
+        desc = desc,
+        model_to_use = model_to_use,
+        provider_norm = provider_norm,
+        api_key_env = api_key_env,
+    );
+    std::fs::write(root.join("manifest.yaml"), manifest)
+        .context("writing manifest.yaml")?;
+
+    let skill = r#"# Reviewer
+
+You are a senior software engineer doing a focused code review.
+
+For the input under `=== INPUT ===`, produce a Markdown report with:
+
+1. **Summary** — one paragraph on what the code does.
+2. **Strengths** — bullet list, be specific.
+3. **Issues** — bullet list, ranked by severity. Cite file paths when known.
+   Distinguish bugs from style/structure feedback.
+4. **Suggestions** — concrete, actionable. Prefer code snippets over prose.
+
+Constraints:
+- Do not invent files or symbols that aren't in the input.
+- If the input is empty or unrelated to code, say so plainly and stop.
+- Keep the report under 600 words.
+"#;
+    std::fs::write(root.join("skills").join("reviewer.md"), skill)
+        .context("writing skills/reviewer.md")?;
+
+    let readme = format!(
+        r#"# {trimmed}
+
+{desc}
+
+## Run it locally
+
+This sandbox doesn't need to be published anywhere. Run it directly from this
+directory:
+
+```sh
+# inline text
+dockagents run . --text "function divide(a, b) {{ return a / b; }}"
+
+# a file
+dockagents run . --input ./some-file.js --output ./report
+
+# a whole directory
+dockagents run . --input ./src/ --output ./report
+```
+
+Set the API key the manifest declares before running:
+
+```sh
+export {api_key_env}=...
+```
+
+## Install into ~/.dockagents/
+
+So you can run it as `dockagents run {trimmed}` from anywhere:
+
+```sh
+dockagents install .
+dockagents run {trimmed} --input ./src/
+```
+
+## Publish (optional)
+
+If you want others to install your sandbox by name:
+
+```sh
+dockagents login              # link this CLI to your dockagents.net account
+dockagents publish .          # uploads + signs
+```
+"#,
+        trimmed = trimmed,
+        desc = desc,
+        api_key_env = api_key_env,
+    );
+    std::fs::write(root.join("README.md"), readme).context("writing README.md")?;
+
+    let gitignore = "workspaces/\noutput/\n.dockagents/\n";
+    std::fs::write(root.join(".gitignore"), gitignore).context("writing .gitignore")?;
+
+    println!("✓ Created {}/", root.display());
+    println!("    manifest.yaml");
+    println!("    skills/reviewer.md");
+    println!("    README.md");
+    println!("    .gitignore");
+    println!();
+    println!("Next steps:");
+    println!("  cd {trimmed}");
+    println!("  export {api_key_env}=...               # set your LLM key");
+    println!("  dockagents run . --text \"hello\"      # try it locally");
+    println!();
+    println!("When you're ready to share it:");
+    println!("  dockagents login                       # one-time, opens browser");
+    println!("  dockagents publish .                   # uploads to {DEFAULT_REGISTRY_URL}");
+    Ok(())
 }
 
 fn cmd_install(
@@ -613,7 +912,7 @@ fn cmd_publish(
         if !remote.has_token() {
             return Err(anyhow!(
                 "no auth token is configured for this registry. \
-                 Mint one at <website>/me and run `dockagents login --token <token>` first."
+                 Mint one at https://dockagents.net/me and run `dockagents login --token <token>` first."
             ));
         }
         let ack = remote.publish(path, sign)?;
@@ -648,6 +947,34 @@ fn cmd_keygen(force: bool) -> Result<()> {
     println!("  created_at: {}", key.created_at);
     println!();
     println!("Keep the private key secret — it identifies this publisher.");
+    Ok(())
+}
+
+fn cmd_pubkey(quiet: bool) -> Result<()> {
+    let pub_path = signing::public_key_path()?;
+    if !pub_path.exists() {
+        return Err(anyhow!(
+            "no publisher key at {} — run `dockagents keygen` first",
+            pub_path.display()
+        ));
+    }
+    let raw = std::fs::read_to_string(&pub_path)
+        .with_context(|| format!("reading {}", pub_path.display()))?;
+    let pubkey_b64 = raw.trim();
+    if pubkey_b64.is_empty() {
+        return Err(anyhow!(
+            "publisher key at {} is empty — regenerate with `dockagents keygen --force`",
+            pub_path.display()
+        ));
+    }
+    if quiet {
+        println!("{pubkey_b64}");
+    } else {
+        println!("pubkey_b64: {pubkey_b64}");
+        println!("file:       {}", pub_path.display());
+        println!();
+        println!("Claim it on https://dockagents.net/me so packages you publish are attributed to you.");
+    }
     Ok(())
 }
 
@@ -849,6 +1176,28 @@ fn cmd_config(action: ConfigCmd) -> Result<()> {
             cfg.save()?;
             println!("Cleared default_llm");
         }
+        ConfigCmd::SetUpdates {
+            check,
+            auto_install,
+            github_repo,
+        } => {
+            let mut cfg = Config::load()?;
+            if let Some(check) = check {
+                cfg.updates.check = check;
+            }
+            if let Some(auto_install) = auto_install {
+                cfg.updates.auto_install = auto_install;
+            }
+            if let Some(repo) = github_repo {
+                cfg.updates.github_repo = crate::updater::normalize_repo(&repo)?;
+            }
+            cfg.save()?;
+            println!("Wrote {}", crate::config::config_path()?.display());
+            println!(
+                "updates: check={} auto_install={} github_repo={}",
+                cfg.updates.check, cfg.updates.auto_install, cfg.updates.github_repo
+            );
+        }
     }
     Ok(())
 }
@@ -859,8 +1208,13 @@ fn cmd_config(action: ConfigCmd) -> Result<()> {
 /// `~/.dockagents/config.yaml`. Auth token is taken from
 /// `DOCKAGENTS_REGISTRY_TOKEN` if set, else from `auth_tokens[<alias or url>]`
 /// in the config (populated by `dockagents login`).
+/// The hosted registry every CLI talks to out of the box. Users who want a
+/// different one can override per-command with `--registry`, by setting
+/// `DOCKAGENTS_REGISTRY_URL`, or by adding a named registry with
+/// `dockagents registry add <name> <url>` + `dockagents registry use <name>`.
+pub const DEFAULT_REGISTRY_URL: &str = "https://registry.dockagents.net";
+
 fn resolve_registry(flag: Option<&str>) -> Result<Option<RemoteRegistry>> {
-    let env_token = std::env::var("DOCKAGENTS_REGISTRY_TOKEN").ok();
     let cfg = crate::config::Config::load()?;
 
     if let Some(f) = flag {
@@ -869,13 +1223,16 @@ fn resolve_registry(flag: Option<&str>) -> Result<Option<RemoteRegistry>> {
             return Ok(None);
         }
         if looks_like_url(f) {
-            let token = env_token.or_else(|| cfg.auth_tokens.get(f).cloned());
+            // Flag is a URL. Find the alias that maps to it (if any) so we can
+            // pick up a token stored under that alias.
+            let alias = cfg.registries.iter().find_map(|(k, v)| {
+                if normalize_url(v) == normalize_url(f) { Some(k.as_str()) } else { None }
+            });
+            let token = find_token(&cfg, alias, f);
             return Ok(Some(RemoteRegistry::new(f.to_string(), token)));
         }
         if let Some(url) = cfg.registries.get(f) {
-            let token = env_token
-                .or_else(|| cfg.auth_tokens.get(f).cloned())
-                .or_else(|| cfg.auth_tokens.get(url).cloned());
+            let token = find_token(&cfg, Some(f), url);
             return Ok(Some(RemoteRegistry::new(url.clone(), token)));
         }
         return Err(anyhow!(
@@ -886,18 +1243,17 @@ fn resolve_registry(flag: Option<&str>) -> Result<Option<RemoteRegistry>> {
 
     // No flag: check env var first.
     if let Some(env_url) = std::env::var("DOCKAGENTS_REGISTRY_URL").ok().filter(|s| !s.trim().is_empty()) {
-        let token = env_token
-            .clone()
-            .or_else(|| cfg.auth_tokens.get(&env_url).cloned());
+        let alias = cfg.registries.iter().find_map(|(k, v)| {
+            if normalize_url(v) == normalize_url(&env_url) { Some(k.as_str()) } else { None }
+        });
+        let token = find_token(&cfg, alias, &env_url);
         return Ok(Some(RemoteRegistry::new(env_url, token)));
     }
 
     if let Some(name) = &cfg.default_registry {
         match cfg.registries.get(name) {
             Some(url) => {
-                let token = env_token
-                    .or_else(|| cfg.auth_tokens.get(name).cloned())
-                    .or_else(|| cfg.auth_tokens.get(url).cloned());
+                let token = find_token(&cfg, Some(name), url);
                 return Ok(Some(RemoteRegistry::new(url.clone(), token)));
             }
             None => tracing::warn!(
@@ -906,7 +1262,51 @@ fn resolve_registry(flag: Option<&str>) -> Result<Option<RemoteRegistry>> {
         }
     }
 
-    Ok(None)
+    // Final fallback: hit the hosted dockagents.net registry. A token, if the
+    // user has logged in there, comes through find_token by URL lookup.
+    let token = find_token(&cfg, None, DEFAULT_REGISTRY_URL);
+    Ok(Some(RemoteRegistry::new(
+        DEFAULT_REGISTRY_URL.to_string(),
+        token,
+    )))
+}
+
+fn normalize_url(s: &str) -> String {
+    s.trim().trim_end_matches('/').to_lowercase()
+}
+
+/// Locate an auth token for a registry. Tries, in order:
+///   1. `DOCKAGENTS_REGISTRY_TOKEN` env var (ignored if empty/whitespace).
+///   2. `auth_tokens[<alias>]` when an alias is known.
+///   3. `auth_tokens[<url>]`.
+///   4. `auth_tokens[<any-alias-mapping-to-this-url>]` — catches the case
+///      where the user logged in via one form (alias or URL) and is now
+///      publishing via the other.
+fn find_token(cfg: &crate::config::Config, alias: Option<&str>, url: &str) -> Option<String> {
+    let non_empty = |s: String| -> Option<String> {
+        if s.trim().is_empty() { None } else { Some(s) }
+    };
+
+    if let Some(t) = std::env::var("DOCKAGENTS_REGISTRY_TOKEN").ok().and_then(non_empty) {
+        return Some(t);
+    }
+    if let Some(a) = alias {
+        if let Some(t) = cfg.auth_tokens.get(a).cloned().and_then(non_empty) {
+            return Some(t);
+        }
+    }
+    if let Some(t) = cfg.auth_tokens.get(url).cloned().and_then(non_empty) {
+        return Some(t);
+    }
+    let norm = normalize_url(url);
+    for (k, v) in &cfg.registries {
+        if normalize_url(v) == norm {
+            if let Some(t) = cfg.auth_tokens.get(k).cloned().and_then(non_empty) {
+                return Some(t);
+            }
+        }
+    }
+    None
 }
 
 fn resolve_login_target(flag: Option<&str>) -> Result<String> {
@@ -924,7 +1324,131 @@ fn resolve_login_target(flag: Option<&str>) -> Result<String> {
     ))
 }
 
-fn cmd_login(token: &str, registry_flag: Option<&str>) -> Result<()> {
+fn cmd_login(
+    token: Option<&str>,
+    registry_flag: Option<&str>,
+    website_flag: Option<&str>,
+    no_browser: bool,
+) -> Result<()> {
+    // Headless / scripted: --token bypasses the browser flow entirely.
+    if let Some(tok) = token {
+        return save_token(tok, registry_flag);
+    }
+
+    // Browser flow.
+    // 1. Resolve which website to talk to.
+    let website = website_flag
+        .map(str::to_string)
+        .or_else(|| std::env::var("DOCKAGENTS_WEBSITE_URL").ok())
+        .unwrap_or_else(|| "https://dockagents.net".to_string());
+    let website = website.trim_end_matches('/').to_string();
+
+    // 2. Make sure we have a publisher public key. If not, mint one — the
+    //    whole point of this flow is to claim that key for the user's account.
+    let pub_path = signing::public_key_path()?;
+    if !pub_path.exists() {
+        tracing::info!("no publisher key yet — generating one");
+        let _ = signing::generate_keypair(false)?;
+    }
+    let pubkey_b64 = std::fs::read_to_string(&pub_path)
+        .with_context(|| format!("reading {}", pub_path.display()))?
+        .trim()
+        .to_string();
+    if pubkey_b64.is_empty() {
+        return Err(anyhow!(
+            "publisher key at {} is empty — regenerate with `dockagents keygen --force`",
+            pub_path.display()
+        ));
+    }
+
+    // 3. Init a CLI-login session on the website.
+    let agent = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(15))
+        .build();
+    let init_url = format!("{website}/api/cli/login/init");
+    let init: serde_json::Value = agent
+        .post(&init_url)
+        .send_json(serde_json::json!({ "pubkey_b64": pubkey_b64 }))
+        .map_err(|e| anyhow!("cannot reach {website}: {e}"))?
+        .into_json()
+        .context("parsing init response")?;
+    let session_id = init
+        .get("session")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("server did not return a session id"))?
+        .to_string();
+    let verify_url = init
+        .get("verify_url")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("server did not return a verify_url"))?
+        .to_string();
+
+    // 4. Open the browser (best-effort) and print the URL.
+    println!("Opening {verify_url} to approve this CLI…");
+    println!();
+    println!("If the browser doesn't open automatically, copy this URL:");
+    println!("    {verify_url}");
+    println!();
+    if !no_browser {
+        let _ = open_browser(&verify_url);
+    }
+
+    // 5. Poll for completion.
+    let poll_url = format!("{website}/api/cli/login/{session_id}/poll");
+    let started = std::time::Instant::now();
+    let timeout = std::time::Duration::from_secs(10 * 60);
+    let mut last_status = "pending".to_string();
+    println!("Waiting for approval…");
+    loop {
+        if started.elapsed() > timeout {
+            return Err(anyhow!(
+                "timed out after 10 minutes — re-run `dockagents login` when ready"
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let resp = match agent.get(&poll_url).call() {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("poll failed (will retry): {e}");
+                continue;
+            }
+        };
+        let body: serde_json::Value = match resp.into_json() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let status = body
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("pending")
+            .to_string();
+        if status == "approved" {
+            let token = body
+                .get("token")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!("approved but no token returned"))?
+                .to_string();
+            let username = body
+                .get("username")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(unknown)");
+            save_token(&token, registry_flag)?;
+            println!();
+            println!("✓ Signed in as @{username}");
+            println!("  Publisher key linked to your account.");
+            println!("  `dockagents publish` will now authenticate automatically.");
+            return Ok(());
+        }
+        if status == "expired" {
+            return Err(anyhow!("session expired — re-run `dockagents login`"));
+        }
+        if status != last_status {
+            last_status = status;
+        }
+    }
+}
+
+fn save_token(token: &str, registry_flag: Option<&str>) -> Result<()> {
     use crate::config::Config;
     if !token.starts_with("dgkp_") || token.len() < 20 {
         return Err(anyhow!(
@@ -935,9 +1459,38 @@ fn cmd_login(token: &str, registry_flag: Option<&str>) -> Result<()> {
     let mut cfg = Config::load()?;
     cfg.auth_tokens.insert(target.clone(), token.to_string());
     cfg.save()?;
-    println!("Saved token for '{target}' to {}", crate::config::config_path()?.display());
-    println!("`dockagents publish` will now authenticate automatically.");
+    println!(
+        "Saved token for '{target}' to {}",
+        crate::config::config_path()?.display()
+    );
     Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn open_browser(url: &str) -> Result<()> {
+    std::process::Command::new("cmd")
+        .args(["/C", "start", "", url])
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| anyhow!("could not open browser: {e}"))
+}
+
+#[cfg(target_os = "macos")]
+fn open_browser(url: &str) -> Result<()> {
+    std::process::Command::new("open")
+        .arg(url)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| anyhow!("could not open browser: {e}"))
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn open_browser(url: &str) -> Result<()> {
+    std::process::Command::new("xdg-open")
+        .arg(url)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| anyhow!("could not open browser: {e}"))
 }
 
 fn cmd_logout(registry_flag: Option<&str>) -> Result<()> {
@@ -950,6 +1503,52 @@ fn cmd_logout(registry_flag: Option<&str>) -> Result<()> {
         println!("Removed token for '{target}'.");
     } else {
         println!("No token was stored for '{target}'.");
+    }
+    Ok(())
+}
+
+fn cmd_update(check_only: bool, yes: bool, repo_flag: Option<&str>) -> Result<()> {
+    let cfg = crate::config::Config::load()?;
+    let repo = match repo_flag {
+        Some(repo) => crate::updater::normalize_repo(repo)?,
+        None => cfg.updates.github_repo.clone(),
+    };
+    let check = crate::updater::check_latest(&repo)?;
+    let Some(info) = check.update else {
+        println!(
+            "dockagents is up to date ({}; latest GitHub release: {}).",
+            crate::updater::CURRENT_VERSION,
+            check.latest_tag
+        );
+        return Ok(());
+    };
+
+    println!(
+        "dockagents update available: {} -> {}",
+        info.current_version, info.latest_tag
+    );
+    println!("release: {}", info.release_url);
+    println!("asset:   {}", info.asset_name);
+
+    if check_only {
+        return Ok(());
+    }
+
+    if !crate::updater::prompt_install(&info, yes)? {
+        println!("Update skipped.");
+        return Ok(());
+    }
+
+    match crate::updater::install_release(&info)? {
+        crate::updater::InstallResult::Replaced { path } => {
+            println!("Updated dockagents at {}", path.display());
+        }
+        crate::updater::InstallResult::Deferred { path } => {
+            println!(
+                "Update downloaded. Windows will replace {} after this process exits.",
+                path.display()
+            );
+        }
     }
     Ok(())
 }
@@ -1009,9 +1608,21 @@ fn cmd_registry(action: RegistryCmd) -> Result<()> {
         RegistryCmd::List => {
             let cfg = Config::load()?;
             if cfg.registries.is_empty() {
-                println!("(no registries configured)");
+                println!("(no registries configured — using the built-in default)");
+                println!("  default          {DEFAULT_REGISTRY_URL}");
                 println!();
-                println!("Try:  dockagents registry add local http://localhost:8787");
+                println!(
+                    "Add another with:  dockagents registry add <name> <url>"
+                );
+                if let Some(env_url) = std::env::var("DOCKAGENTS_REGISTRY_URL")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+                {
+                    println!();
+                    println!(
+                        "note: DOCKAGENTS_REGISTRY_URL is set to {env_url} — it overrides the built-in default in this shell."
+                    );
+                }
                 return Ok(());
             }
             let default = cfg.default_registry.as_deref();
@@ -1023,7 +1634,16 @@ fn cmd_registry(action: RegistryCmd) -> Result<()> {
                 let marker = if Some(name.as_str()) == default { "*" } else { " " };
                 println!("{marker} {name:<16} {url}");
             }
-            if let Ok(env_url) = std::env::var("DOCKAGENTS_REGISTRY_URL") {
+            if default.is_none() {
+                println!();
+                println!(
+                    "no alias is set as default — falling back to {DEFAULT_REGISTRY_URL}"
+                );
+            }
+            if let Some(env_url) = std::env::var("DOCKAGENTS_REGISTRY_URL")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+            {
                 println!();
                 println!(
                     "note: DOCKAGENTS_REGISTRY_URL is set to {env_url} — it overrides the default for this shell."

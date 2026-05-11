@@ -21,6 +21,7 @@ pub mod remote;
 pub mod runtime;
 pub mod signing;
 pub mod sip;
+pub mod updater;
 pub mod watcher;
 
 pub use manifest::Manifest;

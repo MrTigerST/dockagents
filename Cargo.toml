@@ -4,12 +4,16 @@ version = "0.1.0"
 edition = "2021"
 description = "Isolated, distributable, invocable multi-agent environments"
 license = "Apache-2.0"
-repository = "https://github.com/dockagents/dockagents"
+repository = "https://github.com/MrTigerST/dockagents"
 readme = "README.md"
 
 [[bin]]
 name = "dockagents"
 path = "src/main.rs"
+
+[[bin]]
+name = "dockagents-setup"
+path = "src/bin/dockagents-setup.rs"
 
 [dependencies]
 anyhow = "1.0"
@@ -41,6 +45,7 @@ base64 = "0.22"
 notify = "6.1"
 notify-debouncer-mini = "0.4"
 tiny_http = "0.12"
+zip = { version = "2.2", default-features = false, features = ["deflate"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [

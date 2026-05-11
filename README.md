@@ -1,4 +1,8 @@
-# DockAgents
+<p align="center">
+  <img src="https://github.com/MrTigerST/dockagents/raw/main/dockagents-logo.png" width="200" />
+</p>
+
+<h1 align="center">DockAgents</h1
 
 > Isolated, distributable, invocable multi-agent environments — via CLI or
 > from an LLM.
@@ -22,7 +26,36 @@
 | `src/mcp.rs` | MCP server over stdio (`dockagents mcp`). |
 | `src/api.rs` | REST API for orchestrators (`dockagents serve`). |
 | `src/watcher.rs` | File-watcher driven re-runs (`dockagents watch`). |
+| `src/updater.rs` | GitHub Releases update checks, SHA-256 verification, and self-update install. |
 | `src/cli.rs` | All `dockagents <subcommand>` dispatch. |
+
+## Install
+Go to the [Releases Page](https://github.com/MrTigerST/dockagents/releases)
+and download the `dockagents-setup-*` executable for your operating system.
+The setup executable installs `dockagents` and asks whether to add the install
+directory to your OS `PATH`.
+
+Portable `.zip` / `.tar.gz` archives are also published for manual installs.
+
+## Updates
+
+DockAgents checks GitHub Releases once per day and prints a notice when a
+newer OS-specific executable is available. To check or install immediately:
+
+```bash
+dockagents update --check
+dockagents update --yes
+```
+
+To opt in to automatic installs whenever the daily check finds a newer
+release:
+
+```bash
+dockagents config set-updates --auto-install true
+```
+
+Set `DOCKAGENTS_NO_UPDATE_CHECK=1` to disable update checks for a shell, or
+use `dockagents config set-updates --check false` to turn them off globally.
 
 ## Build
 
@@ -144,6 +177,7 @@ dockagents keygen             generate an Ed25519 publisher key
 dockagents mcp                MCP server over stdio
 dockagents serve              REST API for orchestrators
 dockagents watch <name>       auto-rerun on host mount changes
+dockagents update             install the latest GitHub Release executable
 ```
 
 ## Signing

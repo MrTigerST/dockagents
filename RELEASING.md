@@ -1,10 +1,13 @@
 # Releasing & installing dockagents
 
-This document covers two things:
+This document covers three things:
 
 1. **Producing release binaries** — how the GitHub Actions workflow turns a
-   commit into installable binaries for Windows, Linux, and macOS.
-2. **Installing dockagents** from those binaries on each OS.
+   commit into setup executables and portable binaries for Windows, Linux,
+   and macOS.
+2. **Installing dockagents** from those setup executables or portable archives
+   on each OS.
+3. **Updating dockagents** from GitHub Releases after installation.
 
 ## How releases are produced
 
@@ -32,6 +35,10 @@ For example: `v0.1.0+build.42.a1b2c3d`.
 Bumping the version is therefore as simple as editing the `version` field
 in `Cargo.toml` and pushing.
 
+The workflow also embeds the full generated build version in the executable
+as `DOCKAGENTS_BUILD_VERSION`, so `dockagents update` can compare the current
+binary against GitHub release tags that include the build number.
+
 ### Build matrix
 
 | Platform | Runner       | Target triple                | Archive |
@@ -45,6 +52,16 @@ Each archive contains the `dockagents` binary plus `README.md`, this file,
 and `LICENSE` if present. A matching `.sha256` is uploaded alongside every
 archive so installers can verify the download.
 
+Each build also publishes a standalone `dockagents-setup-*` executable for
+that operating system. The setup executable installs the matching DockAgents
+binary and prompts the user to choose whether the install directory should be
+added to that operating system's `PATH`.
+
+DockAgents uses those same release assets for self-updates: it selects the
+archive for the current operating system, verifies the matching `.sha256`,
+extracts the executable, and installs it in place. Windows replacement is
+scheduled after the running `dockagents.exe` process exits.
+
 ### What the release looks like
 
 The job produces a GitHub Release tagged with the auto-version and attaches
@@ -53,8 +70,25 @@ version, build number, and a download table.
 
 ## Installing dockagents from a release
 
-Grab the latest archive for your platform from the
+Grab the latest setup executable for your platform from the
 [**Releases**](https://github.com/MrTigerST/dockagents/releases) page.
+
+Run it directly:
+
+```bash
+./dockagents-setup-linux-x86_64-0.1.0+build.42.a1b2c3d
+```
+
+```powershell
+.\dockagents-setup-windows-x86_64-0.1.0+build.42.a1b2c3d.exe
+```
+
+The setup executable asks where to install `dockagents` and whether to add
+that install directory to `PATH`. Use `--yes` to accept defaults,
+`--install-dir <path>` to choose a directory non-interactively,
+`--add-to-path` to force PATH setup, or `--no-add-to-path` to skip it.
+
+Portable archives are still available for manual installs:
 
 ### Linux (x86_64)
 
@@ -140,6 +174,34 @@ dockagents --version
 
 Windows SmartScreen may warn the first time you run an unsigned binary —
 **More info → Run anyway**.
+
+## Updating dockagents from GitHub
+
+The CLI checks GitHub Releases once per day and prints a notice if a newer
+OS-specific executable is available. To check manually:
+
+```bash
+dockagents update --check
+```
+
+To download, verify, and install the latest release executable:
+
+```bash
+dockagents update --yes
+```
+
+Automatic installs are opt-in:
+
+```bash
+dockagents config set-updates --auto-install true
+```
+
+Disable the daily notice with `DOCKAGENTS_NO_UPDATE_CHECK=1` for one shell,
+or globally with:
+
+```bash
+dockagents config set-updates --check false
+```
 
 ## Verifying a release artifact
 

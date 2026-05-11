@@ -13,6 +13,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::paths;
+use crate::updater::UpdateConfig;
 
 /// Top-level user configuration.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -34,6 +35,9 @@ pub struct Config {
     /// `dockagents login`.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub auth_tokens: HashMap<String, String>,
+    /// GitHub self-update behavior.
+    #[serde(default, skip_serializing_if = "UpdateConfig::is_default")]
+    pub updates: UpdateConfig,
 }
 
 /// User-supplied default LLM. Mirrors the manifest [`crate::manifest::Llm`]

@@ -18,38 +18,51 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # ────────────────────────────────────────────────────────────────────────
-  # Compute a single auto-version that all matrix legs share.
-  # Format: v<cargo_version>+build.<run_number>.<short_sha>
-  # Example: v0.1.0+build.42.a1b2c3d
-  # ────────────────────────────────────────────────────────────────────────
+  # ─────────────────────────────────────────────
+  # VERSION
+  # ─────────────────────────────────────────────
   version:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.compute.outputs.version }}
+      version_file: ${{ steps.compute.outputs.version_file }}
       tag: ${{ steps.compute.outputs.tag }}
       cargo_version: ${{ steps.compute.outputs.cargo_version }}
     steps:
       - uses: actions/checkout@v4
+
       - id: compute
         shell: bash
         run: |
           CARGO_VERSION=$(grep -m1 '^version' Cargo.toml | sed -E 's/version *= *"([^"]+)".*/\1/')
           SHORT_SHA=$(echo "${GITHUB_SHA}" | cut -c1-7)
+          # SemVer-style version used for the git tag + release name.
           VERSION="${CARGO_VERSION}+build.${GITHUB_RUN_NUMBER}.${SHORT_SHA}"
           TAG="v${VERSION}"
+          # Filename-safe variant. Drops the `+` (URL-encodes as %2B and
+          # confuses some download tooling) and the dot before the SHA (which
+          # file managers misread as a file extension on Linux/macOS).
+          VERSION_FILE="${CARGO_VERSION}-build${GITHUB_RUN_NUMBER}-${SHORT_SHA}"
+
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "tag=${TAG}"          >> "$GITHUB_OUTPUT"
+          echo "version_file=${VERSION_FILE}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "cargo_version=${CARGO_VERSION}" >> "$GITHUB_OUTPUT"
+
           echo "Building ${TAG}"
 
-  # ────────────────────────────────────────────────────────────────────────
-  # Cross-platform build matrix.
-  # ────────────────────────────────────────────────────────────────────────
+  # ─────────────────────────────────────────────
+  # BUILD MATRIX
+  # ─────────────────────────────────────────────
   build:
     needs: version
     name: build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
+
+    env:
+      CARGO_INCREMENTAL: 0
+      RUST_BACKTRACE: 1
+
     strategy:
       fail-fast: false
       matrix:
@@ -57,52 +70,213 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             artifact: dockagents-linux-x86_64
+            setup_artifact: dockagents-setup-linux-x86_64
             ext: ""
             archive: tar.gz
+
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact: dockagents-windows-x86_64
+            setup_artifact: dockagents-setup-windows-x86_64
             ext: ".exe"
             archive: zip
-          - os: macos-13
+
+          # ⚡ FIX: macOS su ARM runner (più veloce)
+          - os: macos-14
             target: x86_64-apple-darwin
             artifact: dockagents-macos-x86_64
+            setup_artifact: dockagents-setup-macos-x86_64
             ext: ""
             archive: tar.gz
+
           - os: macos-14
             target: aarch64-apple-darwin
             artifact: dockagents-macos-aarch64
+            setup_artifact: dockagents-setup-macos-aarch64
             ext: ""
             archive: tar.gz
+
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
+      # ─────────────────────────────
+      # Rust setup
+      # ─────────────────────────────
+      - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
-      - name: Cargo cache
+      # ─────────────────────────────
+      # Cache (KEEP THIS)
+      # ─────────────────────────────
+      - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
 
-      - name: Build (release)
+      # ─────────────────────────────
+      # Build
+      # ─────────────────────────────
+      - name: Build release
         shell: bash
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        env:
+          DOCKAGENTS_BUILD_VERSION: ${{ needs.version.outputs.version }}
+        run: cargo build --release --locked --target ${{ matrix.target }} --bins
 
+      # ─────────────────────────────
+      # Package
+      # ─────────────────────────────
       - name: Stage artifact
         shell: bash
         run: |
           set -euo pipefail
+
           mkdir -p dist staging
+
           BIN="target/${{ matrix.target }}/release/dockagents${{ matrix.ext }}"
+          SETUP_BIN="target/${{ matrix.target }}/release/dockagents-setup${{ matrix.ext }}"
           cp "${BIN}" "staging/dockagents${{ matrix.ext }}"
+          cp "${SETUP_BIN}" "staging/dockagents-setup${{ matrix.ext }}"
+
           cp README.md staging/ 2>/dev/null || true
           cp RELEASING.md staging/ 2>/dev/null || true
           cp LICENSE staging/ 2>/dev/null || true
 
-          NAME="${{ matrix.artifact }}-${{ needs.version.outputs.version }}"
+          # Archives keep the version in the name, using the filename-safe form
+          # (no `+`, no dot before the SHA) so file managers don't misread part
+          # of the version as a file extension.
+          NAME="${{ matrix.artifact }}-${{ needs.version.outputs.version_file }}"
+
+          # Setup binaries: native installer format per OS so they don't show
+          # up in downloads folders looking like ".108e792".
+          #   Windows → .exe  (the binary is already a Windows executable)
+          #   macOS   → .dmg  (disk image, double-clickable from Finder)
+          #   Linux   → .deb  (Debian/Ubuntu package; works on the majority
+          #                    of desktop Linux distros and most servers)
+          # Same filename every release — the release tag identifies the
+          # version, which keeps URLs scriptable.
+          case "${{ matrix.os }}" in
+            windows-*) SETUP_OUT_EXT=".exe" ;;
+            macos-*)   SETUP_OUT_EXT=".dmg" ;;
+            *)         SETUP_OUT_EXT=".deb" ;;
+          esac
+          SETUP_NAME="${{ matrix.setup_artifact }}${SETUP_OUT_EXT}"
+
+          case "${SETUP_OUT_EXT}" in
+            .exe)
+              # Real Windows installer via Inno Setup. ISCC is preinstalled
+              # on `windows-latest`. The compiled wizard registers an Apps &
+              # features entry, manages PATH, and generates its own uninstaller.
+              ISCC="/c/Program Files (x86)/Inno Setup 6/ISCC.exe"
+              if [ ! -f "${ISCC}" ]; then
+                ISCC="$(command -v iscc || true)"
+              fi
+              if [ -z "${ISCC}" ] || [ ! -f "${ISCC}" ]; then
+                echo "::error::Inno Setup compiler (ISCC.exe) not found on this runner"
+                exit 1
+              fi
+              # Inno Setup version field must be ASCII / "X.Y.Z(.W)" — strip
+              # the `+build.…` SemVer metadata.
+              ISS_VERSION="${{ needs.version.outputs.cargo_version }}.${{ github.run_number }}"
+              # Convert paths to absolute Windows form. ISCC resolves any
+              # relative `Source:` path against the .iss file's directory
+              # (installer/), not the cwd — so we MUST give it the absolute
+              # path or it will look for installer\target\... and fail with
+              # "Source file ... does not exist."
+              SRC_WIN="$(cygpath -w "$(pwd)/${BIN}")"
+              DIST_WIN="$(cygpath -w "$(pwd)/dist")"
+              OUT_BASE="${{ matrix.setup_artifact }}"   # dockagents-setup-windows-x86_64
+              # Disable MSYS/MSYS2 argument path conversion. Without this the
+              # leading `/` on /DXxx switches and the backslashes inside the
+              # value get rewritten by Git Bash into Unix-style paths before
+              # the call reaches ISCC, which then sees several positional
+              # args and aborts with "You may not specify more than one
+              # script filename."
+              ISS_WIN="$(cygpath -w "$(pwd)/installer/dockagents.iss")"
+              MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL="*" \
+                "${ISCC}" \
+                  "/DDockAgentsVersion=${ISS_VERSION}" \
+                  "/DSourceBinary=${SRC_WIN}" \
+                  "/DOutputDir=${DIST_WIN}" \
+                  "/DOutputBaseName=${OUT_BASE}" \
+                  "${ISS_WIN}"
+              # Inno Setup writes to ${OUT_BASE}.exe — already at the target
+              # filename, so nothing else to do here.
+              ;;
+            .dmg)
+              # Wrap the Mach-O binary in a compressed disk image so it's
+              # recognizable to macOS and double-clickable from Finder.
+              chmod 0755 "${SETUP_BIN}"
+              DMG_STAGE="$(mktemp -d)/DockAgents Setup"
+              mkdir -p "${DMG_STAGE}"
+              cp "${SETUP_BIN}" "${DMG_STAGE}/dockagents-setup"
+              hdiutil create \
+                -volname "DockAgents Setup" \
+                -srcfolder "${DMG_STAGE}" \
+                -ov -format UDZO \
+                "dist/${SETUP_NAME}"
+              ;;
+            .deb)
+              # Hand-build a proper Debian package. dpkg-deb is preinstalled
+              # on ubuntu runners.
+              #
+              # Unlike Windows/macOS, the .deb ships `dockagents` ITSELF
+              # (not the separate setup tool), so `apt remove dockagents` is
+              # the natural uninstall and the package shows up in GNOME
+              # Software / KDE Discover with a Remove button.
+              case "${{ matrix.target }}" in
+                x86_64-*)  DEB_ARCH=amd64 ;;
+                aarch64-*) DEB_ARCH=arm64 ;;
+                *)         DEB_ARCH=amd64 ;;
+              esac
+              chmod 0755 "${BIN}"
+              DEB_STAGE="$(mktemp -d)/deb"
+              mkdir -p "${DEB_STAGE}/DEBIAN" "${DEB_STAGE}/usr/bin"
+              cp "${BIN}" "${DEB_STAGE}/usr/bin/dockagents"
+              # Debian version field forbids `+`, so we use cargo_version-runN.
+              DEB_VERSION="${{ needs.version.outputs.cargo_version }}-${{ github.run_number }}"
+              INSTALLED_KB=$(du -sk "${DEB_STAGE}/usr" | awk '{print $1}')
+              # Write the control file via a brace group of echoes — no
+              # heredoc, so no risk of an indented EOF tripping up bash.
+              {
+                echo "Package: dockagents"
+                echo "Version: ${DEB_VERSION}"
+                echo "Architecture: ${DEB_ARCH}"
+                echo "Maintainer: DockAgents <tigredev1@gmail.com>"
+                echo "Homepage: https://dockagents.net"
+                echo "Section: devel"
+                echo "Priority: optional"
+                echo "Installed-Size: ${INSTALLED_KB}"
+                echo "Description: Distributable multi-agent sandboxes"
+                echo " DockAgents bundles teams of AI agents into versioned,"
+                echo " signed packages you can publish and install from a registry."
+                echo " Ideal for CI/CD pipelines, autonomous agent loops, and any"
+                echo " system that needs an agent to do real work headlessly."
+              } > "${DEB_STAGE}/DEBIAN/control"
+              # postrm: clean up per-user state when --purge is used.
+              {
+                echo '#!/bin/sh'
+                echo 'set -e'
+                echo 'if [ "$1" = "purge" ]; then'
+                echo "  for u in \$(getent passwd | awk -F: '\$3 >= 1000 && \$1 != \"nobody\" {print \$1}'); do"
+                echo '    home=$(getent passwd "$u" | cut -d: -f6)'
+                echo '    [ -d "$home/.dockagents" ] && rm -rf "$home/.dockagents" || true'
+                echo '  done'
+                echo 'fi'
+                echo 'exit 0'
+              } > "${DEB_STAGE}/DEBIAN/postrm"
+              chmod 0755 "${DEB_STAGE}/DEBIAN/postrm"
+              # Output keeps the dockagents-setup-* artifact name purely so
+              # the existing release notes templating finds it; the actual
+              # Package: name inside is "dockagents".
+              dpkg-deb --build --root-owner-group "${DEB_STAGE}" "dist/${SETUP_NAME}"
+              ;;
+            *)
+              cp "${SETUP_BIN}" "dist/${SETUP_NAME}"
+              ;;
+          esac
+
           if [ "${{ matrix.archive }}" = "zip" ]; then
             ARCHIVE="dist/${NAME}.zip"
             (cd staging && 7z a "../${ARCHIVE}" .)
@@ -111,12 +285,13 @@ jobs:
             tar -C staging -czf "${ARCHIVE}" .
           fi
 
-          # Per-file sha256 (lower-case hex) next to the archive.
-          if command -v sha256sum >/dev/null 2>&1; then
-            sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256"
-          else
-            shasum -a 256 "${ARCHIVE}" > "${ARCHIVE}.sha256"
-          fi
+          for ASSET in "${ARCHIVE}" "dist/${SETUP_NAME}"; do
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "${ASSET}" > "${ASSET}.sha256"
+            else
+              shasum -a 256 "${ASSET}" > "${ASSET}.sha256"
+            fi
+          done
 
       - uses: actions/upload-artifact@v4
         with:
@@ -124,12 +299,13 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
-  # ────────────────────────────────────────────────────────────────────────
-  # Collect every matrix output and publish a single Release.
-  # ────────────────────────────────────────────────────────────────────────
+  # ─────────────────────────────────────────────
+  # RELEASE
+  # ─────────────────────────────────────────────
   release:
     needs: [version, build]
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
         with:
@@ -156,17 +332,37 @@ jobs:
             echo "Cargo version: \`${{ needs.version.outputs.cargo_version }}\`"
             echo "Build number: \`${{ github.run_number }}\`"
             echo
-            echo "## Downloads"
+            echo "Each platform includes a standalone setup executable. It installs the matching DockAgents executable for that operating system and asks whether the install directory should be added to that OS PATH automatically."
             echo
-            echo "| Platform | File |"
-            echo "|---|---|"
+            echo "## Setup executables"
+            echo
+            echo "| File |"
+            echo "|---|"
+
+            for f in release/dockagents-setup-*; do
+              [ -f "$f" ] || continue
+              base=$(basename "$f")
+              case "$base" in
+                *.sha256) continue ;;
+              esac
+              echo "| \`${base}\` |"
+            done
+
+            echo
+            echo
+            echo "## Portable archives"
+            echo
+            echo "| File |"
+            echo "|---|"
+
             for f in release/*.zip release/*.tar.gz; do
               [ -f "$f" ] || continue
               base=$(basename "$f")
-              echo "| \`${base%%-*}\` | \`${base}\` |"
+              echo "| \`${base}\` |"
             done
+
             echo
-            echo "Verify with the matching \`.sha256\` next to each archive."
+            echo "Verify any download with the matching .sha256 file."
           } > NOTES.md
 
       - name: Publish GitHub Release
@@ -175,10 +371,8 @@ jobs:
           tag_name: ${{ needs.version.outputs.tag }}
           name: ${{ needs.version.outputs.tag }}
           body_path: NOTES.md
-          draft: false
-          prerelease: false
-          fail_on_unmatched_files: true
           files: |
+            release/dockagents-setup-*
             release/*.zip
             release/*.tar.gz
             release/*.sha256
