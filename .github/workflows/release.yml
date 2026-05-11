@@ -1,0 +1,184 @@
+name: release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/release.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ────────────────────────────────────────────────────────────────────────
+  # Compute a single auto-version that all matrix legs share.
+  # Format: v<cargo_version>+build.<run_number>.<short_sha>
+  # Example: v0.1.0+build.42.a1b2c3d
+  # ────────────────────────────────────────────────────────────────────────
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.compute.outputs.version }}
+      tag: ${{ steps.compute.outputs.tag }}
+      cargo_version: ${{ steps.compute.outputs.cargo_version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: compute
+        shell: bash
+        run: |
+          CARGO_VERSION=$(grep -m1 '^version' Cargo.toml | sed -E 's/version *= *"([^"]+)".*/\1/')
+          SHORT_SHA=$(echo "${GITHUB_SHA}" | cut -c1-7)
+          VERSION="${CARGO_VERSION}+build.${GITHUB_RUN_NUMBER}.${SHORT_SHA}"
+          TAG="v${VERSION}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}"          >> "$GITHUB_OUTPUT"
+          echo "cargo_version=${CARGO_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Building ${TAG}"
+
+  # ────────────────────────────────────────────────────────────────────────
+  # Cross-platform build matrix.
+  # ────────────────────────────────────────────────────────────────────────
+  build:
+    needs: version
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: dockagents-linux-x86_64
+            ext: ""
+            archive: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: dockagents-windows-x86_64
+            ext: ".exe"
+            archive: zip
+          - os: macos-13
+            target: x86_64-apple-darwin
+            artifact: dockagents-macos-x86_64
+            ext: ""
+            archive: tar.gz
+          - os: macos-14
+            target: aarch64-apple-darwin
+            artifact: dockagents-macos-aarch64
+            ext: ""
+            archive: tar.gz
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build (release)
+        shell: bash
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Stage artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist staging
+          BIN="target/${{ matrix.target }}/release/dockagents${{ matrix.ext }}"
+          cp "${BIN}" "staging/dockagents${{ matrix.ext }}"
+          cp README.md staging/ 2>/dev/null || true
+          cp RELEASING.md staging/ 2>/dev/null || true
+          cp LICENSE staging/ 2>/dev/null || true
+
+          NAME="${{ matrix.artifact }}-${{ needs.version.outputs.version }}"
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            ARCHIVE="dist/${NAME}.zip"
+            (cd staging && 7z a "../${ARCHIVE}" .)
+          else
+            ARCHIVE="dist/${NAME}.tar.gz"
+            tar -C staging -czf "${ARCHIVE}" .
+          fi
+
+          # Per-file sha256 (lower-case hex) next to the archive.
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256"
+          else
+            shasum -a 256 "${ARCHIVE}" > "${ARCHIVE}.sha256"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/*
+          if-no-files-found: error
+
+  # ────────────────────────────────────────────────────────────────────────
+  # Collect every matrix output and publish a single Release.
+  # ────────────────────────────────────────────────────────────────────────
+  release:
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Flatten artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          find artifacts -mindepth 1 -type f -exec cp -t release {} +
+          ls -la release
+
+      - name: Build release notes
+        shell: bash
+        run: |
+          {
+            echo "Automated build of \`${{ github.sha }}\` on \`${{ github.ref_name }}\`."
+            echo
+            echo "Cargo version: \`${{ needs.version.outputs.cargo_version }}\`"
+            echo "Build number: \`${{ github.run_number }}\`"
+            echo
+            echo "## Downloads"
+            echo
+            echo "| Platform | File |"
+            echo "|---|---|"
+            for f in release/*.zip release/*.tar.gz; do
+              [ -f "$f" ] || continue
+              base=$(basename "$f")
+              echo "| \`${base%%-*}\` | \`${base}\` |"
+            done
+            echo
+            echo "Verify with the matching \`.sha256\` next to each archive."
+          } > NOTES.md
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.version.outputs.tag }}
+          name: ${{ needs.version.outputs.tag }}
+          body_path: NOTES.md
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: true
+          files: |
+            release/*.zip
+            release/*.tar.gz
+            release/*.sha256

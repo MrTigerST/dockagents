@@ -1,0 +1,54 @@
+name:        indie-devteam
+version:     0.1.0
+description: Code review team for indie developers — reviewer · security · planner
+lifecycle:   persistent
+
+execution:
+  mode:    sync
+  timeout: 240s
+  input:
+    - type: directory
+      accepts: [py, ts, rs, go, js]
+  output:
+    - type: text
+
+agents:
+  - id:        senior-reviewer
+    model:     claude-sonnet-4-5
+    skill:     ./skills/senior-reviewer.md
+    workspace: ./workspaces/reviewer/
+    llm:
+      provider:    anthropic
+      api_key_env: ANTHROPIC_API_KEY
+      max_tokens:  2048
+
+  - id:        security-auditor
+    model:     claude-sonnet-4-5
+    skill:     ./skills/security-auditor.md
+    workspace: ./workspaces/security/
+    llm:
+      provider:    anthropic
+      api_key_env: ANTHROPIC_API_KEY
+      max_tokens:  2048
+
+  - id:        pm-planner
+    model:     claude-sonnet-4-5
+    skill:     ./skills/pm-planner.md
+    workspace: ./workspaces/planner/
+    llm:
+      provider:    anthropic
+      api_key_env: ANTHROPIC_API_KEY
+      max_tokens:  2048
+
+mounts:
+  - host:    ~/Desktop/indie-devteam/
+    sandbox: /output/
+    mode:    readwrite
+
+capabilities:
+  invoke: []        # Phase 3: add `cve-lookup`, `dependency-auditor`
+  network: true
+
+message_bus:
+  topology:   broadcast
+  visibility: post_output

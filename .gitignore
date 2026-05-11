@@ -1,0 +1,7 @@
+/target
+/Cargo.lock.bak
+*.tmp
+.DS_Store
+
+# DockAgents runtime state (when developing locally with HOME pointed here)
+/.dockagents/
